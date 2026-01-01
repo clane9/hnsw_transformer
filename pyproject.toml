@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools_scm[toml]>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hnsw_transformer"
+dynamic = ["version"]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "datasets",
+    "einops",
+    "ipython",
+    "jupyter",
+    "numpy",
+    "omegaconf",
+    "pre-commit",
+    "pytest",
+    "timm",
+    "torch",
+    "torchvision",
+    "transformers",
+    "tqdm",
+    "wandb",
+]
+
+[tool.setuptools_scm]
+version_file = "src/_version.py"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+ignore = ["F722"]

@@ -328,6 +328,11 @@ class HNSWBlock(torch.nn.Module):
         k = self.mlp1_weight
         v = self.mlp2_weight
 
+        # add dummy batch dimensions
+        gates = [expand_dim(g, 0, B) for g in gates]
+        k = expand_dim(k, 0, B)
+        v = expand_dim(v, 0, B)
+
         # search the tree
         # at each level, the actual node vectors are constructed by adding the gate
         # weights as a small residual on top of the parent nodes. this is what creates
@@ -335,9 +340,6 @@ class HNSWBlock(torch.nn.Module):
         parent = None
         for ii in range(self.num_levels - 1):
             gate = gates[ii]
-            # add dummy batch dimension
-            if ii == 0:
-                gate = expand_dim(gate, 0, B)
             # construct the node as residual of parent + scale * weight
             if parent is not None:
                 gate = residual_gate(gate, parent=parent, level=ii)
@@ -350,7 +352,7 @@ class HNSWBlock(torch.nn.Module):
             k = gather_values(indices, k)
             v = gather_values(indices, v)
             # update the parent nodes for the next level
-            parent = gate
+            parent = gather_values(indices, gate)
 
         # final keys as a residual for the lowest level of the tree
         k = residual_gate(k, parent=parent, level=self.num_levels-1)
@@ -397,12 +399,10 @@ def gather_values(indices: torch.Tensor, values: torch.Tensor):
     # gather values over the last index dimension
     # values can have extra trailing dimensions which we expand to
     # indices: (b, k, ..., k)
-    # values: (k, ..., v, ...)
-    B, *shape = indices.shape
-    extra_shape = values.shape[len(shape):]
+    # values: (b, k, ..., v, ...)
+    extra_shape = values.shape[len(indices.shape):]
     indices = indices.reshape(indices.shape + (1,) * len(extra_shape))
     indices = indices.expand(indices.shape + extra_shape)
-    values = expand_dim(values, 0, B)
     values = torch.gather(values, dim=indices.ndim-1, index=indices)
     return values
 

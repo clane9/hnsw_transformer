@@ -2,7 +2,6 @@ import math
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 
 
 @dataclass
@@ -23,7 +22,9 @@ class ModelConfig:
     rope_scaling_factor: float = 32.0
     rope_ntk_alpha: float = 1.0
     rope_ntk_beta: float = 32.0
-
+    num_levels: int = 3
+    num_nbrs: int = 64
+    nbrs_per_token: int = 16
 
 class RMSNorm(torch.nn.Module):
     def __init__(
@@ -252,84 +253,175 @@ def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
     return out_glu * (x_linear + 1)
 
 
-class MLPBlock(torch.nn.Module):
+class HNSWBlock(torch.nn.Module):
+    """
+    An MLP block where active weights are retrieved by an HNSW-inspired hierarchical
+    search.
+
+    The MLP weights are viewed as a large set of (key, value) vector pairs. The input x
+    is seen as a batch of queries. The goal is to retrieve the sparse set of active
+    (key, value) weights for each query.
+
+    The keys are organized as a hierarchical tree over the unit sphere. Starting from
+    the root level, we find the top k closest root keys for each query. We then descend
+    the tree, continuing to take the top k keys at each level. At the bottom level, the
+    remaining keys and corresponding values are selected as active.
+
+    This scheme can be seen as a generalization of the classic MoE MLP block,
+    corresponding the special case of only two levels.
+    """
     def __init__(
         self,
         config: ModelConfig,
         device: torch.device | None = None,
     ):
         super().__init__()
-        self.num_experts = config.num_experts
-        self.experts_per_token = config.experts_per_token
-        self.swiglu_limit = config.swiglu_limit
-        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # number of levels in the tree
+        # classic moe: 2 levels
+        self.num_levels = config.num_levels
+        # number of neighbors branching at each level. also the number of root nodes,
+        # for convenience. we could consider generalizing to arbitrary number of nodes
+        # at each level, but this is ok for now.
+        # classic moe: num_experts root nodes, and hidden_size number of neighbors
+        self.num_nbrs = config.num_nbrs
+        # number of neighbor nodes to retrieve at each level
+        # classic moe: nbrs_per_token = experts_per_token
+        self.nbrs_per_token = config.nbrs_per_token
         self.norm = RMSNorm(config.hidden_size, device=device)
-        self.gate = torch.nn.Linear(
-            config.hidden_size, config.num_experts, device=device, dtype=torch.bfloat16
+        # gelu activation for convenience for now
+        self.gelu = torch.nn.GELU()
+        # gating keys for the top-down search of the tree.
+        # you have num_nbrs ^ i nodes at level i
+        self.gate_weights = torch.nn.ParameterList(
+            torch.nn.Parameter(
+                torch.empty(
+                    (self.num_nbrs,) * (ii + 1) + (config.hidden_size,),
+                    device=device,
+                    dtype=torch.bfloat16,
+                )
+            )
+            for ii in range(self.num_levels - 1)
         )
-        assert config.intermediate_size % self.world_size == 0
+        # the input mlp weights, ie key weights, are at the bottom level.
         self.mlp1_weight = torch.nn.Parameter(
             torch.empty(
-                (
-                    config.num_experts,
-                    config.intermediate_size * 2 // self.world_size,
-                    config.hidden_size,
-                ),
+                (self.num_nbrs,) * self.num_levels + (config.hidden_size,),
                 device=device,
                 dtype=torch.bfloat16,
             )
         )
-        self.mlp1_bias = torch.nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.intermediate_size * 2 // self.world_size),
-                device=device,
-                dtype=torch.bfloat16,
-            )
-        )
+        # the output mlp weights, ie value weights. same number as keys.
         self.mlp2_weight = torch.nn.Parameter(
             torch.empty(
-                (
-                    config.num_experts,
-                    config.hidden_size,
-                    config.intermediate_size // self.world_size,
-                ),
+                (self.num_nbrs,) * self.num_levels + (config.hidden_size,),
                 device=device,
                 dtype=torch.bfloat16,
             )
         )
-        self.mlp2_bias = torch.nn.Parameter(
-            torch.empty(
-                (config.num_experts, config.hidden_size),
-                device=device,
-                dtype=torch.bfloat16,
-            )
-        )
+        # a scale parameter, not sure if we need it. but will see why later.
+        self.scale = torch.nn.Parameter(torch.empty((), device=device, dtype=torch.bfloat16))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C = x.shape
         t = self.norm(x)
-        g = self.gate(t)
-        experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
-        expert_weights = torch.nn.functional.softmax(experts.values, dim=1)
-        expert_indices = experts.indices
 
-        # MLP #1
-        mlp1_weight = self.mlp1_weight[expert_indices, ...]
-        mlp1_bias = self.mlp1_bias[expert_indices, ...]
-        t = torch.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
-        t = swiglu(t, limit=self.swiglu_limit)
+        gates = list(self.gate_weights)
+        k = self.mlp1_weight
+        v = self.mlp2_weight
 
-        # MLP #2
-        mlp2_weight = self.mlp2_weight[expert_indices, ...]
-        mlp2_bias = self.mlp2_bias[expert_indices, ...]
-        t = torch.einsum("beck,bek->bec", mlp2_weight, t)
-        if self.world_size > 1:
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-        t += mlp2_bias
+        # search the tree
+        # at each level, the actual node vectors are constructed by adding the gate
+        # weights as a small residual on top of the parent nodes. this is what creates
+        # the tree structure.
+        parent = None
+        for ii in range(self.num_levels - 1):
+            gate = gates[ii]
+            # add dummy batch dimension
+            if ii == 0:
+                gate = expand_dim(gate, 0, B)
+            # construct the node as residual of parent + scale * weight
+            gate = residual_gate(gate, parent=parent, level=ii)
+            # select the top k nearest nodes at this level
+            indices = apply_gate(gate, t, k=self.nbrs_per_token)
+            # prune the tree for the lower levels still to search
+            for jj in range(ii + 1, self.num_levels - 1):
+                gates[jj] = gather_values(indices, gates[jj])
+            # prune the lowest level keys and values
+            k = gather_values(indices, k)
+            v = gather_values(indices, v)
+            # update the parent nodes for the next level
+            parent = gate
 
-        # Weighted sum of experts
-        t = torch.einsum("bec,be->bc", t, expert_weights)
+        # final keys as a residual for the lowest level of the tree
+        k = residual_gate(k, parent=parent, level=self.num_levels-1)
+
+        # after selection, now just apply mlp as usual
+        k = k.reshape(B, -1, C)
+        v = v.reshape(B, -1, C)
+        t = torch.einsum("bc,bdc->bd", t, k)
+        # this is where that scale parameter comes in
+        # the issue is that the keys are unit norm, which might not be best going into
+        # the gelu.
+        # todo: think about this scaling
+        t = self.gelu(self.scale * t)
+        t = torch.einsum("bd,bdc->bc", t, v)
 
         return x + t
+
+
+def apply_gate(gate: torch.Tensor, x: torch.Tensor, k: int):
+    # select the top k nodes
+    # gate: (b, k, k, ..., v, c)
+    # x: (b, c)
+    # returns:
+    # indices: (b, k, k, ..., k)
+    B, *shape, C = gate.shape
+    B, C = x.shape
+    gate = gate.reshape(B, -1, C)
+    g = torch.einsum("bc,bvc->bv", x, gate)
+    g = g.reshape((B, *shape))
+    _, indices = torch.topk(g, k=k, dim=-1, sorted=True)
+    return indices
+
+
+def residual_gate(gate: torch.Tensor, parent: torch.Tensor | None = None, level: int = 0):
+    # update gate as gate + scale * parent
+    # effectively we are trying to construct a dense multi-scale mesh over the sphere of
+    # progressively finer scales.
+    # inputs:
+    # gate: (*, v, c)
+    # parent: (*, c)
+    if parent is not None:
+        dim = gate.shape[-1]
+        # ensure parent is on sphere
+        parent = torch.nn.functional.normalize(parent, dim=-1)
+        # scale of small residual to ensure a target angular separation
+        # todo: think more about this scaling
+        theta = math.pi / 3 / (1.5 ** level)
+        scale = math.sqrt((1 / dim) * (1 / math.cos(theta) ** 2 - 1))
+        gate = parent.unsqueeze(-2) + scale * gate
+    gate = torch.nn.functional.normalize(gate, dim=-1)
+    return gate
+
+
+def gather_values(indices: torch.Tensor, values: torch.Tensor):
+    # gather values over the last index dimension
+    # values can have extra trailing dimensions which we expand to
+    # indices: (b, k, ..., k)
+    # values: (k, ..., v, ...)
+    B, *shape = indices.shape
+    extra_shape = values.shape[len(shape):]
+    indices = indices.reshape(indices.shape + (1,) * len(extra_shape))
+    indices = indices.expand(indices.shape + extra_shape)
+    values = expand_dim(values, 0, B)
+    values = torch.gather(values, dim=indices.ndim-1, index=indices)
+    return values
+
+
+def expand_dim(x: torch.Tensor, dim: int, size: int):
+    shape = list(x.shape)
+    shape.insert(dim=size)
+    return x.unsqueeze(dim).expand(shape)
 
 
 class TransformerBlock(torch.nn.Module):
@@ -342,7 +434,7 @@ class TransformerBlock(torch.nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.attn = AttentionBlock(config, layer_idx, device)
-        self.mlp = MLPBlock(config, device)
+        self.mlp = HNSWBlock(config, device)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.attn(x)

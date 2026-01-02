@@ -262,7 +262,7 @@ class HNSWBlock(torch.nn.Module):
     is seen as a batch of queries. The goal is to retrieve the sparse set of active
     (key, value) weights for each query.
 
-    The keys are organized as a hierarchical tree over the unit sphere. Starting from
+    The keys are organized as a hierarchical tree over the gaussian sphere. Starting from
     the root level, we find the top k closest root keys for each query. We then descend
     the tree, continuing to take the top k keys at each level. At the bottom level, the
     remaining keys and corresponding values are selected as active.
@@ -303,6 +303,7 @@ class HNSWBlock(torch.nn.Module):
             for ii in range(self.num_levels - 1)
         )
         # the input mlp weights, ie key weights, are at the bottom level.
+        # ignoring bias for now
         self.mlp1_weight = torch.nn.Parameter(
             torch.empty(
                 (self.num_nbrs,) * self.num_levels + (config.hidden_size,),
@@ -318,8 +319,6 @@ class HNSWBlock(torch.nn.Module):
                 dtype=torch.bfloat16,
             )
         )
-        # a scale parameter, not sure if we need it. but will see why later.
-        self.scale = torch.nn.Parameter(torch.empty((), device=device, dtype=torch.bfloat16))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C = x.shape
@@ -340,7 +339,8 @@ class HNSWBlock(torch.nn.Module):
             if ii == 0:
                 gate = expand_dim(gate, 0, B)
             # construct the node as residual of parent + scale * weight
-            gate = residual_gate(gate, parent=parent, level=ii)
+            if parent is not None:
+                gate = residual_gate(gate, parent=parent, level=ii)
             # select the top k nearest nodes at this level
             indices = apply_gate(gate, t, k=self.nbrs_per_token)
             # prune the tree for the lower levels still to search
@@ -359,11 +359,7 @@ class HNSWBlock(torch.nn.Module):
         k = k.reshape(B, -1, C)
         v = v.reshape(B, -1, C)
         t = torch.einsum("bc,bdc->bd", t, k)
-        # this is where that scale parameter comes in
-        # the issue is that the keys are unit norm, which might not be best going into
-        # the gelu.
-        # todo: think about this scaling
-        t = self.gelu(self.scale * t)
+        t = self.gelu(t)
         t = torch.einsum("bd,bdc->bc", t, v)
 
         return x + t
@@ -384,23 +380,16 @@ def apply_gate(gate: torch.Tensor, x: torch.Tensor, k: int):
     return indices
 
 
-def residual_gate(gate: torch.Tensor, parent: torch.Tensor | None = None, level: int = 0):
+def residual_gate(gate: torch.Tensor, parent: torch.Tensor, level: int):
     # update gate as gate + scale * parent
     # effectively we are trying to construct a dense multi-scale mesh over the sphere of
     # progressively finer scales.
     # inputs:
     # gate: (*, v, c)
     # parent: (*, c)
-    if parent is not None:
-        dim = gate.shape[-1]
-        # ensure parent is on sphere
-        parent = torch.nn.functional.normalize(parent, dim=-1)
-        # scale of small residual to ensure a target angular separation
-        # todo: think more about this scaling
-        theta = math.pi / 3 / (1.5 ** level)
-        scale = math.sqrt((1 / dim) * (1 / math.cos(theta) ** 2 - 1))
-        gate = parent.unsqueeze(-2) + scale * gate
-    gate = torch.nn.functional.normalize(gate, dim=-1)
+    # todo: think more about this scaling
+    scale = 0.5 ** level
+    gate = parent.unsqueeze(-2) + scale * gate
     return gate
 
 
